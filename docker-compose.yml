@@ -1,0 +1,14 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sqlacache
+      POSTGRES_USER: sqlacache
+      POSTGRES_PASSWORD: sqlacache
+    ports:
+      - "5432:5432"

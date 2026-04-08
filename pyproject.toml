@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlacache"
+dynamic = ["version"]
+description = "Django-cacheops-style declarative caching with automatic row-level invalidation for SQLAlchemy"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Hamidreza Samsami", email = "hamidreza.samsami@gmail.com" },
+]
+keywords = ["sqlalchemy", "cache", "redis", "asyncio", "orm"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Framework :: AsyncIO",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "sqlalchemy>=1.4",
+  "cashews>=7.0,<8.0",
+]
+
+[project.optional-dependencies]
+redis = ["cashews[redis]>=7.0,<8.0"]
+diskcache = ["cashews[diskcache]>=7.0,<8.0"]
+dill = ["cashews[dill]>=7.0,<8.0"]
+speedup = ["cashews[speedup]>=7.0,<8.0"]
+postgresql = ["asyncpg>=0.30.0"]
+all = [
+  "cashews[redis,diskcache,dill,speedup]>=7.0,<8.0",
+  "asyncpg>=0.30.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/persix/sqlacache"
+Repository = "https://github.com/persix/sqlacache"
+Documentation = "https://github.com/persix/sqlacache/blob/main/README.md"
+Issues = "https://github.com/persix/sqlacache/issues"
+
+[dependency-groups]
+dev = [
+  "aiosqlite>=0.21.0",
+  "build>=1.2.2",
+  "mypy>=1.15.0",
+  "prek>=0.1.0",
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.25.3",
+  "pytest-cov>=6.0.0",
+  "ruff>=0.11.0",
+  "twine>=6.1.0",
+  "ty>=0.0.1a14",
+]
+
+[tool.hatch.version]
+path = "src/sqlacache/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlacache"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "TCH", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sqlacache"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+exclude = ["^tests/"]
+
+[tool.ty]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["-ra"]
+filterwarnings = ["error"]
+markers = [
+  "integration: tests requiring real Redis/PostgreSQL services",
+  "slow: long-running tests",
+]
