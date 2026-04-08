@@ -2,7 +2,7 @@
 
 *Django-cacheops-style declarative caching for SQLAlchemy, with automatic row-level invalidation.*
 
-[![Tests](https://github.com/hamsamsami/sqlacache/actions/workflows/ci.yml/badge.svg)](https://github.com/hamsamsami/sqlacache/actions/workflows/ci.yml)
+[![Tests](https://github.com/hr-samsami/sqlacache/actions/workflows/ci.yml/badge.svg)](https://github.com/hr-samsami/sqlacache/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/sqlacache)](https://pypi.org/project/sqlacache/)
 [![Python](https://img.shields.io/pypi/pyversions/sqlacache)](https://pypi.org/project/sqlacache/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -263,7 +263,7 @@ after_update event → invalidate tag "users:42" → all queries that read row 4
 
 ```bash
 # Clone and install with all dev dependencies
-git clone https://github.com/hamsamsami/sqlacache
+git clone https://github.com/hr-samsami/sqlacache
 cd sqlacache
 uv sync --extra redis --group dev
 
