@@ -29,6 +29,8 @@ Thumbs.db
 .vscode/
 
 # AI assistant tool directories (not project source)
+.claude/
+CLAUDE.md
 .codex/
 .gemini/
 .opencode/
