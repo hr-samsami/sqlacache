@@ -32,6 +32,8 @@ Thumbs.db
 .codex/
 .gemini/
 .opencode/
+.github/prompts/
+.github/skills/
 
 # prek hook runner logs and scratch
 .prek/prek.log
