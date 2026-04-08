@@ -1,0 +1,45 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.ty_cache/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Package managers
+.uv-cache/
+uv.lock.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# AI assistant tool directories (not project source)
+.codex/
+.gemini/
+.opencode/
+
+# prek hook runner logs and scratch
+.prek/prek.log
+.prek/scratch/
+
+# Scratch / research notes not part of the project
+research.md
+landscape-research.md
+
+# Examples (not part of the library itself)
+examples/
