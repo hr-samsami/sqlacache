@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sqlacache"
 dynamic = ["version"]
-description = "Django-cacheops-style declarative caching with automatic row-level invalidation for SQLAlchemy"
+description = "Automatic query caching and row-level cache invalidation for SQLAlchemy"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
