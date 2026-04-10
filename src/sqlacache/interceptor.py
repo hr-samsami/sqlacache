@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, cast
 
 from sqlalchemy.orm import ORMExecuteState, loading
 from sqlalchemy.util import await_only
+from sqlalchemy.util.concurrency import in_greenlet
 
-from sqlacache.invalidation import _bump_table_version, generate_tags
+from sqlacache.invalidation import generate_tags
 from sqlacache.utils.query_analysis import (
     detect_operation_type,
     extract_pks_from_fetch_result,
@@ -53,15 +55,20 @@ def build_do_orm_execute_handler(manager: Any) -> Any:
             return execute_state.invoke_statement()
         if execute_state.execution_options.get("sqlacache_skip_interceptor"):
             return execute_state.invoke_statement()
-
         if execute_state.is_select:
-            if getattr(execute_state.session, "_is_asyncio", False):
+            with contextlib.suppress(Exception):
+                if getattr(execute_state.load_options, "_populate_existing", False):
+                    return execute_state.invoke_statement()
+        if execute_state.is_select:
+            if in_greenlet():
                 return await_only(resolve_cached_result(manager, execute_state))
             return execute_state.invoke_statement()
         if execute_state.is_update or execute_state.is_delete:
-            if getattr(execute_state.session, "_is_asyncio", False):
-                return await_only(handle_bulk_mutation(manager, execute_state))
-            return execute_state.invoke_statement()
+            result = execute_state.invoke_statement()
+            models = manager._extract_models(execute_state.statement)
+            for model in models:
+                manager._schedule_table_bump(model)
+            return result
         return execute_state.invoke_statement()
 
     return handler
@@ -119,10 +126,8 @@ async def resolve_cached_result(manager: Any, execute_state: ORMExecuteState) ->
 
 async def handle_bulk_mutation(manager: Any, execute_state: ORMExecuteState) -> Any:
     statement = execute_state.statement
-    result = execute_state.invoke_statement()
     models = manager._extract_models(statement)
-    transport = manager._transport
-    if transport is not None:
-        for model in models:
-            await _bump_table_version(transport, model)
+    result = execute_state.invoke_statement()
+    for model in models:
+        manager._schedule_table_bump(model)
     return result

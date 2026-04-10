@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 def extract_model_from_statement(statement: Any) -> type[Any] | list[type[Any]] | None:
-    """Extract ORM model classes referenced by a select statement."""
+    """Extract ORM model classes referenced by a select or DML statement."""
 
     models: list[type[Any]] = []
     for description in getattr(statement, "column_descriptions", []):
@@ -22,10 +22,15 @@ def extract_model_from_statement(statement: Any) -> type[Any] | list[type[Any]] 
             models.append(entity)
 
     if not models:
+        entity_desc = getattr(statement, "entity_description", None)
+        if entity_desc is not None:
+            entity = entity_desc.get("entity")
+            if isinstance(entity, type):
+                models.append(entity)
+
+    if not models:
         return None
-    if len(models) == 1:
-        return models[0]
-    return models
+    return models[0] if len(models) == 1 else models
 
 
 def extract_pk_from_instance(instance: Any) -> Any:
@@ -33,9 +38,7 @@ def extract_pk_from_instance(instance: Any) -> Any:
 
     mapper = inspect(instance).mapper
     values = tuple(getattr(instance, column.key) for column in mapper.primary_key)
-    if len(values) == 1:
-        return values[0]
-    return values
+    return values[0] if len(values) == 1 else values
 
 
 def extract_pks_from_fetch_result(

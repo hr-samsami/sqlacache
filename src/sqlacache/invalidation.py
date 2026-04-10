@@ -10,10 +10,10 @@ if TYPE_CHECKING:
 _TABLE_VERSION_PREFIX = "__sqlacache_tv__"
 
 
-def generate_tags(model: type[Any], pks: list[Any]) -> list[str]:
+def generate_tags(model: type[Any] | str, pks: list[Any]) -> list[str]:
     """Generate dependency tags from model/table and PK values."""
 
-    table_name = model.__tablename__
+    table_name = model if isinstance(model, str) else model.__tablename__
     return [f"{table_name}:{pk}" for pk in pks if pk is not None]
 
 

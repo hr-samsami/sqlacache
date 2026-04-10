@@ -18,8 +18,6 @@ async def test_cross_process_invalidation(redis_client) -> None:
     finally:
         await pubsub.disconnect()
 
-    assert True
-
 
 async def _collect_event(events, event):
     events.append(event)

@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from typing import Any
 
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects import sqlite
 
 
 def statement_to_sql(statement: Any, params: dict[str, Any] | None = None) -> str:
     """Compile a SQLAlchemy statement into a deterministic SQL string."""
 
-    compiled = statement.compile(
-        dialect=sqlite.dialect(),
-        compile_kwargs={"literal_binds": True},
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=sa_exc.SAWarning)
+        compiled = statement.compile(
+            dialect=sqlite.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
     sql = " ".join(str(compiled).split())
     if params:
         params_json = json.dumps(params, sort_keys=True, default=str, separators=(",", ":"))

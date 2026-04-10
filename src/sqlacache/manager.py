@@ -72,9 +72,7 @@ class CacheManager:
 
     def is_enabled(self, model: type[Any], op: str) -> bool:
         model_config = self.get_model_config(model)
-        if not model_config:
-            return False
-        return op in model_config["ops"]
+        return op in model_config["ops"] if model_config else False
 
     async def execute(self, session: Any, statement: Any, timeout: int | None = None) -> Any:
         await self._ensure_transport()
@@ -99,8 +97,8 @@ class CacheManager:
 
         pks_by_model = extract_pks_from_fetch_result(list(frozen.data), models)
         tags: list[str] = []
-        for model, pks in pks_by_model.items():
-            tags.extend(generate_tags(model, pks))
+        for tag_model, tag_pks in pks_by_model.items():
+            tags.extend(generate_tags(tag_model, tag_pks))
         await transport.set(key, frozen, expire=expire, tags=tags)
         return merge_cached_result(session, statement, frozen)
 
@@ -169,9 +167,7 @@ class CacheManager:
         extracted = extract_model_from_statement(statement)
         if extracted is None:
             return []
-        if isinstance(extracted, list):
-            return extracted
-        return [extracted]
+        return extracted if isinstance(extracted, list) else [extracted]
 
     async def _build_cache_key(self, statement: Any, models: list[type[Any]]) -> str:
         prefix = self._config["prefix"]
@@ -342,7 +338,9 @@ class CacheManager:
         mapper = entity.__mapper__
         pk_columns = list(mapper.primary_key)
         values = [ident] if len(pk_columns) == 1 and not isinstance(ident, tuple) else list(ident)
-        statement = select(entity).where(*[column == value for column, value in zip(pk_columns, values, strict=False)])
+        if len(pk_columns) != len(values):
+            raise ValueError(f"Expected {len(pk_columns)} primary key values for {entity.__name__}, got {len(values)}")
+        statement = select(entity).where(*[column == value for column, value in zip(pk_columns, values, strict=True)])
         if execution_options:
             statement = statement.execution_options(**dict(execution_options))
         return statement
