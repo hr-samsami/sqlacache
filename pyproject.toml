@@ -46,10 +46,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/persix/sqlacache"
-Repository = "https://github.com/persix/sqlacache"
-Documentation = "https://github.com/persix/sqlacache/blob/main/README.md"
-Issues = "https://github.com/persix/sqlacache/issues"
+Homepage = "https://github.com/hr-samsami/sqlacache"
+Repository = "https://github.com/hr-samsami/sqlacache"
+Documentation = "https://github.com/hr-samsami/sqlacache/blob/main/README.md"
+Issues = "https://github.com/hr-samsami/sqlacache/issues"
 
 [dependency-groups]
 dev = [
