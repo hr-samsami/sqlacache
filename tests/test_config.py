@@ -277,21 +277,12 @@ class TestConfigure:
     def test_config_is_accessible(self) -> None:
         manager = configure(backend="mem://", models={"*": {"timeout": 60}})
         assert manager.config["prefix"] == "sqlacache"
-        assert manager.config["invalidation"] == "row"
         assert manager.config["default_timeout"] == 3600
         assert manager.config["serializer"] == "sqlalchemy"
 
     def test_custom_prefix(self) -> None:
         manager = configure(backend="mem://", models={"*": {"timeout": 60}}, prefix="myapp")
         assert manager.config["prefix"] == "myapp"
-
-    def test_custom_invalidation_mode(self) -> None:
-        manager = configure(backend="mem://", models={"*": {"timeout": 60}}, invalidation="table")
-        assert manager.config["invalidation"] == "table"
-
-    def test_invalid_invalidation_mode(self) -> None:
-        with pytest.raises(ConfigError, match="Unsupported invalidation mode"):
-            configure(backend="mem://", models={"*": {"timeout": 60}}, invalidation="invalid")
 
     def test_invalid_default_timeout_zero(self) -> None:
         with pytest.raises(ConfigError, match="default_timeout must be a positive integer"):

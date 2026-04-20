@@ -138,15 +138,12 @@ def configure(
     backend: str | Mapping[str, Any],
     models: Mapping[str, Mapping[str, Any] | None],
     serializer: str = "sqlalchemy",
-    invalidation: str = "row",
     prefix: str = "sqlacache",
     default_timeout: int = 3600,
     compress: str | None = None,
 ) -> CacheManager:
     """Create a cache manager from validated configuration."""
 
-    if invalidation not in {"row", "table"}:
-        raise ConfigError(f"Unsupported invalidation mode: {invalidation!r}")
     if not isinstance(default_timeout, int) or default_timeout <= 0:
         raise ConfigError("default_timeout must be a positive integer")
 
@@ -167,7 +164,6 @@ def configure(
             "models": normalized_models,
             "wildcard": wildcard_config,
             "serializer": serializer,
-            "invalidation": invalidation,
             "prefix": prefix,
             "default_timeout": default_timeout,
             "compress": compress,
