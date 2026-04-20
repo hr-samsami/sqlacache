@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 
 import sqlacache.interceptor as interceptor_module
 from sqlacache.interceptor import (
-    build_bulk_delete_handler,
-    build_bulk_update_handler,
     build_do_orm_execute_handler,
-    build_invalidation_handler,
+    build_post_commit_handler,
+    build_rollback_handler,
+    build_track_instance_handler,
 )
 
 from .conftest import User
@@ -47,33 +47,92 @@ class DummyExecuteState:
 
 
 class TestDoOrmExecuteHandler:
-    def test_routes_selects_to_async_path(self, cache: Any) -> None:
+    def test_select_cache_hit_returns_merged(self, cache: Any) -> None:
+        """On cache hit, handler calls await_only(_lookup_cache) and merges the frozen result."""
+
         manager = cache
         manager._matches_session = lambda session: True  # type: ignore[method-assign]
         session = Session()
         execute_state = DummyExecuteState(session, select(User), object())
 
-        def fake_await_only(value: Any) -> str:
-            value.close()
-            return "handled-select"
+        # Simulate the two await_only calls the handler makes:
+        # 1. _lookup_cache → returns (frozen, key) on hit, None on miss.
+        fake_frozen = object()
+        calls: list[str] = []
+
+        def fake_await_only(coro: Any) -> Any:
+            coro.close()
+            calls.append("await_only")
+            return (fake_frozen, "some-key")
+
+        def fake_merge(sess: Any, stmt: Any, frozen: Any) -> str:
+            assert frozen is fake_frozen
+            return "merged"
+
+        orig_await = interceptor_module.await_only
+        orig_greenlet = interceptor_module.in_greenlet
+        orig_merge = interceptor_module.merge_cached_result
+        interceptor_module.await_only = fake_await_only
+        interceptor_module.in_greenlet = lambda: True
+        interceptor_module.merge_cached_result = fake_merge
+
+        try:
+            handler = build_do_orm_execute_handler(manager)
+            assert handler(execute_state) == "merged"
+            assert calls == ["await_only"]
+        finally:
+            interceptor_module.await_only = orig_await
+            interceptor_module.in_greenlet = orig_greenlet
+            interceptor_module.merge_cached_result = orig_merge
+
+    def test_select_cache_miss_invokes_statement(self, cache: Any) -> None:
+        """On cache miss, handler invokes the statement then stores the result."""
+
+        manager = cache
+        manager._matches_session = lambda session: True  # type: ignore[method-assign]
+        session = Session()
+        sentinel_result = object()
+        execute_state = DummyExecuteState(session, select(User), sentinel_result)
+
+        # Track the sequence: lookup returns None (miss), invoke_statement is
+        # called, then _store_and_merge is awaited.
+        call_log: list[str] = []
+        orig_invoke = execute_state.invoke_statement
+
+        def logged_invoke() -> Any:
+            call_log.append("invoke")
+            return orig_invoke()
+
+        execute_state.invoke_statement = logged_invoke  # type: ignore[method-assign]
+
+        call_count = [0]
+
+        def fake_await_only(coro: Any) -> Any:
+            coro.close()
+            call_count[0] += 1
+            if call_count[0] == 1:
+                call_log.append("lookup")
+                return None  # miss
+            call_log.append("store")
+            return "stored-and-merged"
 
         orig_await = interceptor_module.await_only
         orig_greenlet = interceptor_module.in_greenlet
         interceptor_module.await_only = fake_await_only
         interceptor_module.in_greenlet = lambda: True
-
         try:
             handler = build_do_orm_execute_handler(manager)
-            assert handler(execute_state) == "handled-select"
+            assert handler(execute_state) == "stored-and-merged"
+            assert call_log == ["lookup", "invoke", "store"]
         finally:
             interceptor_module.await_only = orig_await
             interceptor_module.in_greenlet = orig_greenlet
 
-    def test_routes_update_schedules_table_bump(self, cache: Any) -> None:
+    def test_update_records_bulk_mutation(self, cache: Any) -> None:
         manager = cache
         manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        recorded: list[tuple[Any, type]] = []
+        manager._record_bulk_mutation = lambda session, model: recorded.append((session, model))
         session = Session()
         sentinel = object()
         execute_state = DummyExecuteState(session, select(User), sentinel, is_select=False, is_update=True)
@@ -81,13 +140,13 @@ class TestDoOrmExecuteHandler:
         handler = build_do_orm_execute_handler(manager)
         result = handler(execute_state)
         assert result is sentinel
-        assert bumped == [User]
+        assert recorded == [(session, User)]
 
-    def test_routes_delete_schedules_table_bump(self, cache: Any) -> None:
+    def test_delete_records_bulk_mutation(self, cache: Any) -> None:
         manager = cache
         manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        recorded: list[tuple[Any, type]] = []
+        manager._record_bulk_mutation = lambda session, model: recorded.append((session, model))
         session = Session()
         sentinel = object()
         execute_state = DummyExecuteState(session, select(User), sentinel, is_select=False, is_delete=True)
@@ -95,7 +154,7 @@ class TestDoOrmExecuteHandler:
         handler = build_do_orm_execute_handler(manager)
         result = handler(execute_state)
         assert result is sentinel
-        assert bumped == [User]
+        assert recorded == [(session, User)]
 
     def test_skip_interceptor_option(self, cache: Any) -> None:
         manager = cache
@@ -146,86 +205,139 @@ class TestDoOrmExecuteHandler:
         assert handler(execute_state) is sentinel
 
 
-# --- build_invalidation_handler ---
+# --- build_track_instance_handler ---
 
 
-class TestInvalidationHandler:
-    def test_schedules_invalidation(self, cache: Any) -> None:
+class TestTrackInstanceHandler:
+    def test_records_instance_change(self, cache: Any) -> None:
+        """Mapper event fires with an attached instance → manager records (session, model, target)."""
+
         manager = cache
-        calls: list[tuple[Any, Any, str]] = []
-        manager._schedule_invalidation = lambda model, target, action: calls.append((model, target, action))
+        calls: list[tuple[Any, type, Any]] = []
+        manager._record_instance_change = lambda session, model, target: calls.append((session, model, target))
 
-        handler = build_invalidation_handler(manager, "insert")
+        handler = build_track_instance_handler(manager, "insert")
+        mapper = MagicMock()
+        mapper.class_ = User
+
+        # Simulate an instance with a valid session attached via SQLAlchemy state.
+        target = User(id=1, name="u")
+        fake_session = object()
+        fake_state = MagicMock()
+        fake_state.session = fake_session
+
+        orig_inspect = interceptor_module.sa_inspect
+        interceptor_module.sa_inspect = lambda obj: fake_state
+        try:
+            handler(mapper, MagicMock(), target)
+        finally:
+            interceptor_module.sa_inspect = orig_inspect
+
+        assert calls == [(fake_session, User, target)]
+
+    def test_no_session_attached_is_noop(self, cache: Any) -> None:
+        manager = cache
+        calls: list[Any] = []
+        manager._record_instance_change = lambda *args, **kwargs: calls.append(args)
+
+        handler = build_track_instance_handler(manager, "insert")
         mapper = MagicMock()
         mapper.class_ = User
         target = User(id=1, name="u")
 
-        handler(mapper, MagicMock(), target)
+        fake_state = MagicMock()
+        fake_state.session = None
 
-        assert len(calls) == 1
-        assert calls[0] == (User, target, "insert")
+        orig_inspect = interceptor_module.sa_inspect
+        interceptor_module.sa_inspect = lambda obj: fake_state
+        try:
+            handler(mapper, MagicMock(), target)
+        finally:
+            interceptor_module.sa_inspect = orig_inspect
 
-    def test_different_actions(self, cache: Any) -> None:
+        assert calls == []
+
+
+class _FakeSession:
+    """Hashable, weak-ref-able stand-in for Session in manager.pending tests."""
+
+
+# --- build_post_commit_handler ---
+
+
+class TestPostCommitHandler:
+    def test_no_pending_is_noop(self, cache: Any) -> None:
         manager = cache
-        calls: list[str] = []
-        manager._schedule_invalidation = lambda model, target, action: calls.append(action)
+        session = _FakeSession()
+        # Ensure nothing pending.
+        manager._pending.pop(session, None)
 
-        for action in ("insert", "update", "delete"):
-            handler = build_invalidation_handler(manager, action)
-            handler(MagicMock(class_=User), MagicMock(), User(id=1, name="u"))
+        handler = build_post_commit_handler(manager)
+        handler(session)  # should not raise
 
-        assert calls == ["insert", "update", "delete"]
+    def test_schedules_flush_and_pops_pending(self, cache: Any) -> None:
+        """Handler pops the session's pending set and schedules it for flush."""
 
-
-# --- build_bulk_update_handler / build_bulk_delete_handler ---
-
-
-class TestBulkHandlers:
-    def test_bulk_update_schedules_table_bump(self, cache: Any) -> None:
         manager = cache
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        session = _FakeSession()
+        manager._pending[session] = {"rows": {User: [1, 2]}, "bulk_tables": set()}
 
-        handler = build_bulk_update_handler(manager)
-        ctx = MagicMock()
-        ctx.mapper.class_ = User
+        scheduled: list[Any] = []
+        manager._schedule_flush = lambda pending: scheduled.append(pending)
 
-        handler(ctx)
-        assert bumped == [User]
+        handler = build_post_commit_handler(manager)
+        handler(session)
 
-    def test_bulk_delete_schedules_table_bump(self, cache: Any) -> None:
+        assert len(scheduled) == 1
+        assert scheduled[0]["rows"] == {User: [1, 2]}
+        assert session not in manager._pending
+
+    def test_no_transport_is_noop(self, cache: Any) -> None:
         manager = cache
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        session = _FakeSession()
+        manager._pending[session] = {"rows": {User: [1]}, "bulk_tables": set()}
 
-        handler = build_bulk_delete_handler(manager)
-        ctx = MagicMock()
-        ctx.mapper.class_ = User
+        scheduled: list[Any] = []
+        manager._schedule_flush = lambda pending: scheduled.append(pending)
 
-        handler(ctx)
-        assert bumped == [User]
+        orig_transport = manager._transport
+        manager._transport = None
+        try:
+            handler = build_post_commit_handler(manager)
+            handler(session)
+        finally:
+            manager._transport = orig_transport
 
-    def test_bulk_update_no_mapper_is_noop(self, cache: Any) -> None:
+        # Pending was popped, but nothing scheduled because transport is gone.
+        assert scheduled == []
+        assert session not in manager._pending
+
+
+# --- build_rollback_handler ---
+
+
+class TestRollbackHandler:
+    def test_discards_pending(self, cache: Any) -> None:
         manager = cache
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        session = _FakeSession()
+        manager._pending[session] = {"rows": {User: [1]}, "bulk_tables": set()}
 
-        handler = build_bulk_update_handler(manager)
-        ctx = MagicMock(spec=[])  # no mapper attribute
+        handler = build_rollback_handler(manager)
+        handler(session)
 
-        handler(ctx)
-        assert bumped == []
+        assert session not in manager._pending
 
-    def test_bulk_delete_no_mapper_is_noop(self, cache: Any) -> None:
+    def test_handles_extra_args(self, cache: Any) -> None:
+        """after_soft_rollback passes a previous_transaction arg; handler must accept it."""
+
         manager = cache
-        bumped: list[type] = []
-        manager._schedule_table_bump = lambda model: bumped.append(model)
+        session = _FakeSession()
+        manager._pending[session] = {"rows": {}, "bulk_tables": {User}}
 
-        handler = build_bulk_delete_handler(manager)
-        ctx = MagicMock(spec=[])
+        handler = build_rollback_handler(manager)
+        handler(session, previous_transaction=MagicMock())
 
-        handler(ctx)
-        assert bumped == []
+        assert session not in manager._pending
 
 
 # --- merge_cached_result ---

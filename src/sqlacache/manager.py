@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -11,13 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Session
 
 from sqlacache.interceptor import (
-    build_bulk_delete_handler,
-    build_bulk_update_handler,
     build_do_orm_execute_handler,
-    build_invalidation_handler,
-    handle_bulk_mutation,
+    build_post_commit_handler,
+    build_rollback_handler,
+    build_track_instance_handler,
     merge_cached_result,
-    resolve_cached_result,
 )
 from sqlacache.invalidation import _bump_table_version, _get_table_version, generate_tags, invalidate_tags
 from sqlacache.transport.cashews import CashewsTransport
@@ -46,6 +45,11 @@ class CacheManager:
         self._pubsub_task: asyncio.Task[Any] | None = None
         self._pubsub: RedisPubSub | None = None
         self._listeners: list[tuple[Any, str, Any]] = []
+        # Per-session pending invalidations, accumulated during flush and applied
+        # in after_commit. WeakKeyDictionary so abandoned sessions don't leak.
+        self._pending: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        # Background tasks spawned for post-commit invalidation; tracked so we can
+        # await/cancel them on disconnect().
         self._pending_tasks: set[asyncio.Task[Any]] = set()
 
     @property
@@ -132,9 +136,12 @@ class CacheManager:
         if self._pubsub is not None:
             await self._pubsub.disconnect()
             self._pubsub = None
-        for task in list(self._pending_tasks):
-            task.cancel()
+        # Wait briefly for in-flight post-commit invalidations to finish so we
+        # don't drop cache evictions on shutdown.
+        if self._pending_tasks:
+            await asyncio.gather(*self._pending_tasks, return_exceptions=True)
         self._pending_tasks.clear()
+        self._pending.clear()
         if self._transport is not None:
             await self._transport.disconnect()
             self._transport = None
@@ -186,6 +193,9 @@ class CacheManager:
         self._listeners.append((Session, "do_orm_execute", select_listener))
         event.listen(Session, "do_orm_execute", select_listener, retval=True)
 
+        # Mapper-level events fire during flush (before commit). They only record
+        # pending invalidations on the session; we defer the actual cache eviction
+        # to after_commit so rolled-back transactions never invalidate the cache.
         for model_path in self._model_config:
             if model_path == "*":
                 continue
@@ -198,17 +208,23 @@ class CacheManager:
                 ("after_update", "update"),
                 ("after_delete", "delete"),
             ):
-                listener = build_invalidation_handler(self, action)
+                listener = build_track_instance_handler(self, action)
                 self._listeners.append((model, identifier, listener))
                 event.listen(model, identifier, listener, propagate=True)
 
-        bulk_update_listener = build_bulk_update_handler(self)
-        self._listeners.append((Session, "after_bulk_update", bulk_update_listener))
-        event.listen(Session, "after_bulk_update", bulk_update_listener)
+        # Commit-time invalidation: apply everything recorded during flush.
+        commit_listener = build_post_commit_handler(self)
+        self._listeners.append((Session, "after_commit", commit_listener))
+        event.listen(Session, "after_commit", commit_listener)
 
-        bulk_delete_listener = build_bulk_delete_handler(self)
-        self._listeners.append((Session, "after_bulk_delete", bulk_delete_listener))
-        event.listen(Session, "after_bulk_delete", bulk_delete_listener)
+        # Rollback: drop everything recorded during flush so we don't evict
+        # based on writes that never made it to the database.
+        rollback_listener = build_rollback_handler(self)
+        self._listeners.append((Session, "after_rollback", rollback_listener))
+        event.listen(Session, "after_rollback", rollback_listener)
+        # after_soft_rollback covers nested savepoint rollbacks too.
+        self._listeners.append((Session, "after_soft_rollback", rollback_listener))
+        event.listen(Session, "after_soft_rollback", rollback_listener)
 
     async def _maybe_setup_pubsub(self) -> None:
         from sqlacache.pubsub.redis import RedisPubSub
@@ -252,38 +268,65 @@ class CacheManager:
             }
         )
 
-    def _schedule_invalidation(self, model: type[Any], target: Any, action: str) -> None:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        pk = extract_pk_from_instance(target)
-        task = asyncio.create_task(self.invalidate(model=model, pks=[pk]))
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+    def _record_instance_change(self, session: Any, model: type[Any], target: Any) -> None:
+        """Record a row mutation for invalidation on commit.
 
-    def _schedule_table_bump(self, model: type[Any]) -> None:
+        Called from mapper-level ``after_insert``/``after_update``/``after_delete``
+        events, which fire during flush (before the transaction commits). We
+        extract the PK now (while the instance is still attached) but defer the
+        actual cache eviction until ``after_commit``.
+        """
+
+        try:
+            pk = extract_pk_from_instance(target)
+        except Exception:
+            return
+        if pk is None:
+            return
+        pending = self._pending.setdefault(session, {"rows": {}, "bulk_tables": set()})
+        pending["rows"].setdefault(model, []).append(pk)
+
+    def _record_bulk_mutation(self, session: Any, model: type[Any]) -> None:
+        """Record a bulk UPDATE/DELETE for table-level invalidation on commit."""
+
+        pending = self._pending.setdefault(session, {"rows": {}, "bulk_tables": set()})
+        pending["bulk_tables"].add(model)
+
+    def _drop_pending(self, session: Any) -> None:
+        """Discard recorded mutations for a session (e.g. after rollback)."""
+
+        self._pending.pop(session, None)
+
+    async def flush_pending(self) -> None:
+        """Wait for any in-flight post-commit invalidations to complete.
+
+        Call this after ``session.commit()`` when you need strict read-after-write
+        consistency against the cache on the same session (e.g. in tests, or when
+        a request commits and then immediately re-reads the same row). Normal
+        request-per-session patterns don't need this because the invalidation
+        task completes within one event loop turn.
+        """
+
+        if not self._pending_tasks:
+            return
+        await asyncio.gather(*list(self._pending_tasks), return_exceptions=True)
+
+    def _schedule_flush(self, pending: dict[str, Any]) -> None:
+        """Schedule invalidation application on the current event loop (sync Session path).
+
+        For AsyncSession, the ``after_commit`` handler drives the coroutine
+        synchronously via ``await_only`` instead of going through this method.
+        """
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        transport = self._transport
-        if transport is None:
+        if self._transport is None:
             return
-        task = loop.create_task(_bump_table_version(transport, model))
+        task = loop.create_task(self._apply_pending(pending))
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
-
-    def _handle_select(self, execute_state: Any) -> Any:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return self._run_sync(resolve_cached_result(self, execute_state))
-        else:
-            return execute_state.invoke_statement()
-
-    def _handle_bulk_mutation(self, execute_state: Any) -> Any:
-        return self._run_sync(handle_bulk_mutation(self, execute_state))
 
     @staticmethod
     def _run_sync(coro: Any) -> Any:
@@ -292,6 +335,26 @@ class CacheManager:
         except RuntimeError:
             return asyncio.run(coro)
         raise RuntimeError("Sync wrappers cannot be used while an event loop is already running")
+
+    async def _apply_pending(self, pending: dict[str, Any]) -> None:
+        transport = self._transport
+        if transport is None:
+            return
+        rows: dict[type[Any], list[Any]] = pending.get("rows", {})
+        bulk_tables: set[type[Any]] = pending.get("bulk_tables", set())
+        # Bulk mutations invalidate the entire table; no need to also evict
+        # per-row tags for models in bulk_tables.
+        for model, pks in rows.items():
+            if model in bulk_tables:
+                continue
+            deduped = list(dict.fromkeys(pks))
+            tags = generate_tags(model, deduped)
+            if tags:
+                await invalidate_tags(transport, *tags)
+            await self._publish_invalidation(model, deduped, action="row")
+        for model in bulk_tables:
+            await _bump_table_version(transport, model)
+            await self._publish_invalidation(model, [], action="table")
 
     @classmethod
     def _patch_async_get(cls) -> None:
