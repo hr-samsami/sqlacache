@@ -4,12 +4,39 @@ from __future__ import annotations
 
 import json
 
-from sqlacache.serializers.json import ModelJSONSerializer
+from sqlacache.serializers.json import ModelJSONEncoder, ModelJSONSerializer
 
 from .conftest import CompositeRecord, User
 
 
+class TestModelJSONEncoder:
+    """The primary, non-deprecated API."""
+
+    def setup_method(self) -> None:
+        self.encoder = ModelJSONEncoder()
+
+    def test_encode_instance(self) -> None:
+        user = User(id=1, name="alice")
+        parsed = json.loads(self.encoder.encode(user))
+        assert parsed == {"id": 1, "name": "alice"}
+
+    def test_encode_list(self) -> None:
+        users = [User(id=1, name="a"), User(id=2, name="b")]
+        parsed = json.loads(self.encoder.encode(users))
+        assert parsed == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+    def test_decode_returns_dict_not_instance(self) -> None:
+        """The one-way contract is explicit: decode returns a dict."""
+
+        payload = self.encoder.encode(User(id=1, name="a"))
+        result = self.encoder.decode(payload)
+        assert isinstance(result, dict)
+        assert not isinstance(result, User)
+
+
 class TestModelJSONSerializer:
+    """Backwards-compatible alias."""
+
     def setup_method(self) -> None:
         self.serializer = ModelJSONSerializer()
 
