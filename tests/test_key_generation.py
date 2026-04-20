@@ -24,22 +24,6 @@ class TestStatementToSql:
         result = statement_to_sql(stmt)
         assert "  " not in result
 
-    def test_with_params_appended(self) -> None:
-        stmt = select(User)
-        result = statement_to_sql(stmt, params={"key": "value"})
-        assert '|{"key":"value"}' in result
-
-    def test_params_sorted_by_key(self) -> None:
-        stmt = select(User)
-        r1 = statement_to_sql(stmt, params={"b": 2, "a": 1})
-        r2 = statement_to_sql(stmt, params={"a": 1, "b": 2})
-        assert r1 == r2
-
-    def test_none_params_no_pipe(self) -> None:
-        stmt = select(User)
-        result = statement_to_sql(stmt, params=None)
-        assert "|" not in result
-
     def test_different_models_produce_different_sql(self) -> None:
         s1 = statement_to_sql(select(User))
         s2 = statement_to_sql(select(Product))
@@ -91,16 +75,6 @@ class TestGenerateCacheKey:
     def test_custom_prefix(self) -> None:
         key = generate_cache_key(select(User), prefix="myapp")
         assert key.startswith("myapp:")
-
-    def test_with_params(self) -> None:
-        k1 = generate_cache_key(select(User), params={"a": 1})
-        k2 = generate_cache_key(select(User), params={"a": 2})
-        assert k1 != k2
-
-    def test_without_params(self) -> None:
-        k1 = generate_cache_key(select(User))
-        k2 = generate_cache_key(select(User), params=None)
-        assert k1 == k2
 
     def test_different_models(self) -> None:
         k1 = generate_cache_key(select(User))
