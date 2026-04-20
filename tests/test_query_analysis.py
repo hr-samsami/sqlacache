@@ -203,3 +203,17 @@ class TestDetectOperationType:
     def test_filtered_non_pk_is_fetch(self) -> None:
         stmt = select(User).where(User.name == "test")
         assert detect_operation_type(stmt, [User]) == "fetch"
+
+    def test_literal_containing_count_is_not_count(self) -> None:
+        """Regression: a WHERE clause literal containing 'count(' in text
+        previously matched the substring check and was misclassified as a count
+        query. AST inspection correctly sees this is a plain SELECT."""
+
+        stmt = select(User).where(User.name.like("%count(%"))
+        assert detect_operation_type(stmt, [User]) == "fetch"
+
+    def test_literal_containing_exists_is_not_exists(self) -> None:
+        """Likewise for 'EXISTS' as a literal substring."""
+
+        stmt = select(User).where(User.name == "EXISTS in my data")
+        assert detect_operation_type(stmt, [User]) == "fetch"

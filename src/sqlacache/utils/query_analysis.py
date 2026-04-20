@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import inspect
+from sqlalchemy.sql import functions
 from sqlalchemy.sql.elements import BinaryExpression
 from sqlalchemy.sql.selectable import Exists
 
@@ -58,16 +59,27 @@ def extract_pks_from_fetch_result(
 
 
 def detect_operation_type(statement: Any, models: list[type[Any]] | None = None) -> str:
-    """Infer the cache operation kind for a SELECT statement."""
+    """Infer the cache operation kind for a SELECT statement.
+
+    Inspects the SQLAlchemy AST rather than stringifying the statement and
+    searching for ``"COUNT("`` / ``"EXISTS"`` substrings — the substring approach
+    has false positives from user-supplied literals (e.g. a WHERE clause like
+    ``Model.description.like("%count(%")``) and depends on dialect-specific
+    stringification.
+    """
 
     if isinstance(statement, Exists):
         return "exists"
 
-    sql = str(statement).upper()
-    if "COUNT(" in sql:
-        return "count"
-    if "EXISTS" in sql:
-        return "exists"
+    raw_columns = getattr(statement, "_raw_columns", None)
+    if raw_columns:
+        for col in raw_columns:
+            if isinstance(col, Exists):
+                return "exists"
+            # sqlalchemy.sql.functions.count is the generic aggregate function.
+            if isinstance(col, functions.count):
+                return "count"
+
     if models and len(models) == 1 and _is_primary_key_lookup(statement, models[0]):
         return "get"
     return "fetch"
