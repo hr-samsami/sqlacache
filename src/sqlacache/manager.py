@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -26,6 +27,13 @@ from sqlacache.utils.query_analysis import extract_model_from_statement, extract
 if TYPE_CHECKING:
     from sqlacache.pubsub.redis import RedisPubSub
     from sqlacache.transport import CacheTransport
+
+logger = logging.getLogger(__name__)
+
+# Pub/sub invalidation payload schema version. Bump when the payload format
+# changes in a non-backward-compatible way; workers with a different version
+# will skip events rather than mis-apply them.
+_PUBSUB_PROTOCOL_VERSION = 1
 
 
 class CacheManager:
@@ -237,6 +245,19 @@ class CacheManager:
         await self._pubsub.connect()
 
         async def on_invalidate(event_payload: dict[str, Any]) -> None:
+            # Ignore events we don't know how to handle rather than applying
+            # them with potentially wrong semantics. If a future version of
+            # sqlacache changes the payload schema, older workers in a mixed
+            # deployment will just skip the event — still safe, since stale
+            # entries will TTL out eventually.
+            event_version = event_payload.get("version", 1)
+            if event_version != _PUBSUB_PROTOCOL_VERSION:
+                logger.debug(
+                    "sqlacache: skipping pub/sub event with version %r (expected %r)",
+                    event_version,
+                    _PUBSUB_PROTOCOL_VERSION,
+                )
+                return
             table = event_payload.get("table")
             pks = event_payload.get("pks", [])
             if not table:
@@ -248,7 +269,7 @@ class CacheManager:
             else:
                 await _bump_table_version(transport, table)
 
-        await self._pubsub.listen(on_invalidate)
+        self._pubsub.add_callback(on_invalidate)
         await self._pubsub.start()
 
     async def _ensure_transport(self) -> None:
@@ -264,7 +285,7 @@ class CacheManager:
                 "table": model.__tablename__,
                 "pks": pks,
                 "action": action,
-                "version": 1,
+                "version": _PUBSUB_PROTOCOL_VERSION,
             }
         )
 

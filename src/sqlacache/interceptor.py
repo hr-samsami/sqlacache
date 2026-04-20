@@ -9,7 +9,27 @@ from typing import Any, cast
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import ORMExecuteState, loading
 from sqlalchemy.util import await_only
-from sqlalchemy.util.concurrency import in_greenlet
+
+# ``in_greenlet`` lives in a private SQLAlchemy module. Guard the import so we
+# degrade gracefully if its location changes in a future SQLAlchemy release,
+# rather than breaking the whole library on upgrade.
+try:
+    from sqlalchemy.util.concurrency import in_greenlet
+except ImportError:  # pragma: no cover - depends on SQLAlchemy internals
+    from greenlet import getcurrent
+
+    def in_greenlet() -> bool:
+        """Fallback: replicates SQLAlchemy's provider-greenlet check.
+
+        Any SQLAlchemy version that still uses the ``greenlet``-based async
+        bridge sets ``__sqlalchemy_greenlet_provider__`` on the provider
+        greenlet. If that flag mechanism itself changes, this falls back to
+        returning False, which degrades the cache path to a pass-through
+        rather than erroring.
+        """
+
+        current = getcurrent()
+        return bool(getattr(current, "__sqlalchemy_greenlet_provider__", False))
 
 from sqlacache.invalidation import generate_tags
 from sqlacache.utils.query_analysis import (
