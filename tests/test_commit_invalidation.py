@@ -195,3 +195,36 @@ class TestCommitTimeInvalidation:
 
         # Rollback clears it.
         assert session.sync_session not in cache._pending
+
+
+class TestEagerLoadBypass:
+    """Statements with eager relationship loaders bypass the cache.
+
+    Caching them would silently return stale joined data when a related row
+    changes, since sqlacache doesn't track the relationship as a dependency.
+    """
+
+    async def test_selectinload_bypasses_cache(
+        self, cache: "CacheManager", session: "AsyncSession", caplog: "Any"
+    ) -> None:
+        import logging
+
+        from sqlalchemy.orm import selectinload
+
+        from .conftest import Order
+
+        session.add(User(id=70, name="u"))
+        await session.commit()
+        await cache.flush_pending()
+        session.add(Order(id=1, user_id=70, label="first"))
+        await session.commit()
+        await cache.flush_pending()
+
+        with caplog.at_level(logging.WARNING, logger="sqlacache.interceptor"):
+            result = await session.execute(
+                select(User).where(User.id == 70).options(selectinload(User.orders))
+            )
+            user = result.scalar_one()
+            assert user.name == "u"
+
+        assert any("bypassing cache" in rec.message for rec in caplog.records)

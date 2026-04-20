@@ -212,13 +212,21 @@ session.get(User, 42)
 
 session.commit()  [User id=42 changed]
     │
-    └── after_flush event → delete tag "users:42" → all reads that touched that row are evicted
+    ├── during flush: mapper events record pending invalidation on the session
+    │                 (transaction might still roll back, so nothing is evicted yet)
+    │
+    └── after_commit event → delete tag "users:42" → all reads that touched that row are evicted
           └── (Redis) → pub/sub → other workers evict their copies too
+
+session.rollback()
+    │
+    └── after_rollback event → discard pending invalidations (cache stays intact)
 ```
 
 - Cache keys are a hash of the compiled SQL + bound parameters + a per-table version counter.
 - Tags (`"{tablename}:{pk}"`) let cashews atomically evict all keys that depended on a row.
 - Bulk `UPDATE ... WHERE ...` bumps a table-level version so all cached queries for that model go stale.
+- Invalidation is deferred to commit time: rolled-back transactions never evict the cache.
 
 ---
 
@@ -226,7 +234,8 @@ session.commit()  [User id=42 changed]
 
 - **Async only.** Sync `Session` is not supported yet (planned for v0.2.0).
 - **Bulk writes use table-level invalidation.** `session.execute(update(Model).where(...))` evicts all cached reads for that model, not just the affected rows.
-- **Eager-loaded relationships are not tracked.** If a related row changes, queries that joined or selectin-loaded it won't be invalidated.
+- **Eager-loaded relationships bypass the cache.** Statements using `selectinload` / `joinedload` / `subqueryload` / `immediateload` are not cached at all — they go straight to the database. sqlacache does not track related rows as dependencies, so caching a joined result could silently return stale data when a related row changes. Bypassing is safer. You'll see a `WARNING` on the `sqlacache.interceptor` logger each time this happens. If you want to cache, load the related data in a separate query.
+- **Invalidation runs after commit.** Mapper events during flush only *record* pending invalidations; the cache is evicted in `after_commit`. This means rolled-back transactions correctly leave the cache untouched, but also that invalidation is scheduled on the event loop rather than awaited inline. For strict read-after-write on the same session (e.g. in tests), call `await cache_manager.flush_pending()` after `session.commit()`.
 - **Raw SQL is not intercepted.** `text(...)` and `engine.execute()` bypass sqlacache entirely.
 
 ---

@@ -101,6 +101,35 @@ def _extract_model_instance(row: Any, model: type[Any]) -> Any | None:
     return None
 
 
+def has_eager_loaders(statement: Any) -> bool:
+    """Return True if the statement has selectin/joined/subquery/immediate load options.
+
+    These options bring in related rows that sqlacache does not track as cache
+    dependencies. Caching such a result would return stale joined data if a
+    related row changed. Rather than silently returning wrong answers, the
+    interceptor bypasses the cache for statements with eager loaders.
+
+    Column-level options (``load_only``, ``defer``) and explicit ``lazyload`` /
+    ``raiseload`` / ``noload`` are fine: they don't introduce untracked
+    dependencies.
+    """
+
+    eager_strategies = {"selectin", "joined", "subquery", "immediate"}
+    options = getattr(statement, "_with_options", ())
+    for option in options:
+        context = getattr(option, "context", None)
+        if context is None:
+            continue
+        for item in context:
+            strategy = getattr(item, "strategy", None)
+            if not strategy:
+                continue
+            for key, value in strategy:
+                if key == "lazy" and value in eager_strategies:
+                    return True
+    return False
+
+
 def _is_primary_key_lookup(statement: Any, model: type[Any]) -> bool:
     mapper = inspect(model)
     pk_keys = {column.key for column in mapper.primary_key}

@@ -15,6 +15,7 @@ from sqlacache.invalidation import generate_tags
 from sqlacache.utils.query_analysis import (
     detect_operation_type,
     extract_pks_from_fetch_result,
+    has_eager_loaders,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,18 @@ def build_do_orm_execute_handler(manager: Any) -> Any:
             statement = execute_state.statement
             models = manager._extract_models(statement)
             if not models:
+                return execute_state.invoke_statement()
+            if has_eager_loaders(statement):
+                # Eager-loaded relationships introduce dependencies on related
+                # rows that sqlacache does not track. Caching the result would
+                # return stale joined data when a related row changes. Bypass
+                # rather than silently return wrong answers.
+                logger.warning(
+                    "sqlacache: bypassing cache for %s — statement uses eager loading "
+                    "(selectinload/joinedload/subqueryload/immediateload), which is not "
+                    "supported; see README 'Caveats'.",
+                    models[0].__name__,
+                )
                 return execute_state.invoke_statement()
             op = detect_operation_type(statement, models)
             primary_model = models[0]

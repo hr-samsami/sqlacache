@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import ForeignKey
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from sqlacache import CacheManager, configure
 from sqlacache.transport.cashews import CashewsTransport
@@ -24,6 +25,16 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str]
+    orders: Mapped[list["Order"]] = relationship(back_populates="user")
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    label: Mapped[str]
+    user: Mapped[User] = relationship(back_populates="orders")
 
 
 class Product(Base):
