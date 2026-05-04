@@ -14,7 +14,7 @@ read immediately after a commit call ``cache.flush_pending()`` first.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, select, update
 
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class TestCommitTimeInvalidation:
-    async def test_commit_invalidates_row_cache(self, cache: "CacheManager", session: "AsyncSession") -> None:
+    async def test_commit_invalidates_row_cache(self, cache: CacheManager, session: AsyncSession) -> None:
         """After commit, the row read should reflect the new value, not the cached one."""
 
         session.add(User(id=1, name="original"))
@@ -50,7 +50,7 @@ class TestCommitTimeInvalidation:
         assert refreshed is not None
         assert refreshed.name == "updated"
 
-    async def test_rollback_preserves_cache(self, cache: "CacheManager", session: "AsyncSession") -> None:
+    async def test_rollback_preserves_cache(self, cache: CacheManager, session: AsyncSession) -> None:
         """Rollback must not evict cache entries built from committed state."""
 
         session.add(User(id=2, name="committed"))
@@ -71,7 +71,7 @@ class TestCommitTimeInvalidation:
         # No pending invalidations should be left on the session.
         assert session.sync_session not in cache._pending
 
-    async def test_bulk_update_invalidates_on_commit(self, cache: "CacheManager", session: "AsyncSession") -> None:
+    async def test_bulk_update_invalidates_on_commit(self, cache: CacheManager, session: AsyncSession) -> None:
         """Bulk UPDATE should bump table version after commit."""
 
         session.add_all([User(id=10, name="a"), User(id=11, name="b")])
@@ -94,9 +94,7 @@ class TestCommitTimeInvalidation:
         users = result.scalars().all()
         assert all(u.name == "renamed" for u in users)
 
-    async def test_bulk_update_rollback_does_not_invalidate(
-        self, cache: "CacheManager", session: "AsyncSession"
-    ) -> None:
+    async def test_bulk_update_rollback_does_not_invalidate(self, cache: CacheManager, session: AsyncSession) -> None:
         session.add(User(id=20, name="original"))
         await session.commit()
         await cache.flush_pending()
@@ -112,7 +110,7 @@ class TestCommitTimeInvalidation:
         # No pending invalidations should remain.
         assert session.sync_session not in cache._pending
 
-    async def test_delete_invalidates_on_commit(self, cache: "CacheManager", session: "AsyncSession") -> None:
+    async def test_delete_invalidates_on_commit(self, cache: CacheManager, session: AsyncSession) -> None:
         session.add(User(id=30, name="doomed"))
         await session.commit()
         await cache.flush_pending()
@@ -128,9 +126,7 @@ class TestCommitTimeInvalidation:
         result = await session.get(User, 30)
         assert result is None
 
-    async def test_multiple_mutations_single_commit(
-        self, cache: "CacheManager", session: "AsyncSession"
-    ) -> None:
+    async def test_multiple_mutations_single_commit(self, cache: CacheManager, session: AsyncSession) -> None:
         """Several row changes in one transaction should all be applied atomically."""
 
         session.add_all([User(id=40, name="p"), User(id=41, name="q"), User(id=42, name="r")])
@@ -157,9 +153,7 @@ class TestCommitTimeInvalidation:
             assert u is not None
             assert u.name == expected
 
-    async def test_bulk_delete_invalidates_on_commit(
-        self, cache: "CacheManager", session: "AsyncSession"
-    ) -> None:
+    async def test_bulk_delete_invalidates_on_commit(self, cache: CacheManager, session: AsyncSession) -> None:
         session.add_all([User(id=50, name="x"), User(id=51, name="y")])
         await session.commit()
         await cache.flush_pending()
@@ -177,9 +171,7 @@ class TestCommitTimeInvalidation:
         result = await session.execute(select(User).where(User.id.in_([50, 51])))
         assert result.scalars().all() == []
 
-    async def test_no_invalidation_without_commit(
-        self, cache: "CacheManager", session: "AsyncSession"
-    ) -> None:
+    async def test_no_invalidation_without_commit(self, cache: CacheManager, session: AsyncSession) -> None:
         """Mapper events alone (flush without commit) should not invalidate."""
 
         session.add(User(id=60, name="draft"))
@@ -204,9 +196,7 @@ class TestEagerLoadBypass:
     changes, since sqlacache doesn't track the relationship as a dependency.
     """
 
-    async def test_selectinload_bypasses_cache(
-        self, cache: "CacheManager", session: "AsyncSession", caplog: "Any"
-    ) -> None:
+    async def test_selectinload_bypasses_cache(self, cache: CacheManager, session: AsyncSession, caplog: Any) -> None:
         import logging
 
         from sqlalchemy.orm import selectinload
@@ -221,9 +211,7 @@ class TestEagerLoadBypass:
         await cache.flush_pending()
 
         with caplog.at_level(logging.WARNING, logger="sqlacache.interceptor"):
-            result = await session.execute(
-                select(User).where(User.id == 70).options(selectinload(User.orders))
-            )
+            result = await session.execute(select(User).where(User.id == 70).options(selectinload(User.orders)))
             user = result.scalar_one()
             assert user.name == "u"
 

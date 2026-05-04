@@ -25,7 +25,7 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str]
-    orders: Mapped[list["Order"]] = relationship(back_populates="user")
+    orders: Mapped[list[Order]] = relationship(back_populates="user")
 
 
 class Order(Base):

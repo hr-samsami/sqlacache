@@ -98,9 +98,7 @@ class RedisPubSub:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.warning(
-                        "sqlacache: pub/sub reconnect failed (%s); retrying in %.1fs", exc, backoff
-                    )
+                    logger.warning("sqlacache: pub/sub reconnect failed (%s); retrying in %.1fs", exc, backoff)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, _BACKOFF_MAX)
                     continue
@@ -108,6 +106,7 @@ class RedisPubSub:
                     logger.info("sqlacache: pub/sub connected")
                     backoff = _BACKOFF_INITIAL
 
+            assert self._pubsub is not None
             try:
                 async for message in self._pubsub.listen():
                     if self._stopping:

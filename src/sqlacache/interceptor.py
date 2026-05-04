@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - depends on SQLAlchemy internals
         current = getcurrent()
         return bool(getattr(current, "__sqlalchemy_greenlet_provider__", False))
 
+
 from sqlacache.invalidation import generate_tags
 from sqlacache.utils.query_analysis import (
     detect_operation_type,

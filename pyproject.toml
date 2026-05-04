@@ -87,6 +87,10 @@ python_version = "3.10"
 strict = true
 exclude = ["^tests/"]
 
+[[tool.mypy.overrides]]
+module = ["greenlet.*"]
+ignore_missing_imports = true
+
 [tool.ty]
 
 [tool.pytest.ini_options]

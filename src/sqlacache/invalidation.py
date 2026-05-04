@@ -31,8 +31,7 @@ def generate_tags(model: type[Any] | str, pks: list[Any]) -> list[str]:
         tags.append(f"{table_name}:{pk}")
     if dropped:
         logger.warning(
-            "sqlacache: dropped %d None PK(s) while generating tags for %s; "
-            "likely an unflushed or detached instance",
+            "sqlacache: dropped %d None PK(s) while generating tags for %s; likely an unflushed or detached instance",
             dropped,
             table_name,
         )
