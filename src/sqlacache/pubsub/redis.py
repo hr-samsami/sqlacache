@@ -1,5 +1,3 @@
-"""Redis pub/sub adapter for invalidation events."""
-
 from __future__ import annotations
 
 import asyncio

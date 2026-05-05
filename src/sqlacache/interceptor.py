@@ -1,5 +1,3 @@
-"""SQLAlchemy ORM interception hooks."""
-
 from __future__ import annotations
 
 import contextlib
@@ -94,7 +92,12 @@ def build_do_orm_execute_handler(manager: Any) -> Any:
             if not manager.is_enabled(primary_model, op):
                 return execute_state.invoke_statement()
 
-            lookup = await_only(_lookup_cache(manager, statement, models))
+            # ``parameters`` carries values supplied at execute time — for
+            # example ``Session.get`` shares a compiled ``_get_clause`` and
+            # passes the PK separately. Without folding parameters into the
+            # cache key, every PK lookup on a model would collide.
+            parameters = execute_state.parameters
+            lookup = await_only(_lookup_cache(manager, statement, models, parameters))
             if lookup is not None:
                 cached_frozen, _ = lookup
                 return merge_cached_result(execute_state.session, statement, cached_frozen)
@@ -104,7 +107,9 @@ def build_do_orm_execute_handler(manager: Any) -> Any:
             result = execute_state.invoke_statement()
             model_config = manager.get_model_config(primary_model)
             timeout = model_config["timeout"] if model_config else manager.config["default_timeout"]
-            return await_only(_store_and_merge(manager, execute_state.session, statement, result, models, timeout))
+            return await_only(
+                _store_and_merge(manager, execute_state.session, statement, result, models, timeout, parameters)
+            )
         if execute_state.is_update or execute_state.is_delete:
             result = execute_state.invoke_statement()
             # Record the bulk mutation on the session; the actual table-version
@@ -118,10 +123,12 @@ def build_do_orm_execute_handler(manager: Any) -> Any:
     return handler
 
 
-async def _lookup_cache(manager: Any, statement: Any, models: list[type[Any]]) -> tuple[Any, str] | None:
+async def _lookup_cache(
+    manager: Any, statement: Any, models: list[type[Any]], parameters: Any = None
+) -> tuple[Any, str] | None:
     """Pure-cache lookup with no DB IO. Returns (frozen_result, key) or None on miss."""
 
-    key = await manager._build_cache_key(statement, models)
+    key = await manager._build_cache_key(statement, models, parameters=parameters)
     cached = await manager._transport.get(key)
     if cached is None:
         return None
@@ -135,6 +142,7 @@ async def _store_and_merge(
     result: Any,
     models: list[type[Any]],
     timeout: int,
+    parameters: Any = None,
 ) -> Any:
     """Freeze, store in cache, and return a merged result."""
 
@@ -143,7 +151,7 @@ async def _store_and_merge(
     tags: list[str] = []
     for model, pks in pks_by_model.items():
         tags.extend(generate_tags(model, pks))
-    key = await manager._build_cache_key(statement, models)
+    key = await manager._build_cache_key(statement, models, parameters=parameters)
     await manager._transport.set(key, frozen, expire=timeout, tags=tags)
     return merge_cached_result(session, statement, frozen)
 
@@ -177,17 +185,17 @@ def build_track_instance_handler(manager: Any, action: str) -> Any:
 def build_post_commit_handler(manager: Any) -> Any:
     """Build the Session.after_commit handler.
 
-    Applies all invalidations recorded during flush. Scheduling on the running
-    loop (rather than awaiting inline) keeps us out of the SQLAlchemy greenlet
-    stack, which turns out to be fragile if we call ``await_only`` here —
-    subsequent queries in the same session can fail with ``MissingGreenlet``.
+    Applies invalidations recorded during flush. Path depends on context:
 
-    The tradeoff is a small post-commit window where a read on the same
-    session could still hit the cache before the invalidation task runs.
-    ``_apply_pending`` is scheduled eagerly so this window is a single event
-    loop turn; for strict read-after-write consistency, callers should use
-    ``session.expunge_all()`` + a fresh session, or await
-    ``cache_manager.flush_pending()`` before reading.
+    - **Async (provider greenlet active):** drive ``_apply_pending`` inline via
+      ``await_only`` so the cache is evicted *before* ``await session.commit()``
+      returns. This closes the stale-read window where a subsequent read on
+      the same session would otherwise still see the cached pre-commit value.
+    - **Sync Session under a running loop:** schedule the eviction on the loop.
+      Strict read-after-write on this path needs
+      ``await cache_manager.flush_pending()``.
+    - **Sync Session, no running loop:** drop the invalidation rather than spin
+      up a loop just to evict. Sync support is deferred to v0.2 anyway.
     """
 
     def handler(session: Any) -> None:
@@ -195,6 +203,11 @@ def build_post_commit_handler(manager: Any) -> Any:
         if not pending:
             return
         if manager._transport is None:
+            return
+        if in_greenlet():
+            # AsyncSession path: evict inline so `await session.commit()`
+            # returns only once the cache is consistent.
+            await_only(manager._apply_pending(pending))
             return
         manager._schedule_flush(pending)
 

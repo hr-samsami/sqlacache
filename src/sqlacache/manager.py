@@ -1,15 +1,14 @@
-"""Cache manager primitives."""
-
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 import weakref
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import Session
 
 from sqlacache.interceptor import (
@@ -19,10 +18,20 @@ from sqlacache.interceptor import (
     build_track_instance_handler,
     merge_cached_result,
 )
-from sqlacache.invalidation import _bump_table_version, _get_table_version, generate_tags, invalidate_tags
+from sqlacache.invalidation import (
+    _bump_table_version,
+    _encode_composite_pk,
+    _get_table_version,
+    generate_tags,
+    invalidate_tags,
+)
 from sqlacache.transport.cashews import CashewsTransport
 from sqlacache.utils.key_generation import generate_cache_key
-from sqlacache.utils.query_analysis import extract_model_from_statement, extract_pk_from_instance
+from sqlacache.utils.query_analysis import (
+    extract_model_from_statement,
+    extract_pk_from_instance,
+    probe_eager_loader_detection,
+)
 
 if TYPE_CHECKING:
     from sqlacache.pubsub.redis import RedisPubSub
@@ -35,13 +44,14 @@ logger = logging.getLogger(__name__)
 # will skip events rather than mis-apply them.
 _PUBSUB_PROTOCOL_VERSION = 1
 
+# Eager-loader detection runs once per process: if SA internals drift it would
+# log a warning every bind, which is noisy in test suites that bind/unbind a
+# manager dozens of times.
+_eager_loader_probe_done = False
+
 
 class CacheManager:
     """Manage normalized cache configuration and runtime bindings."""
-
-    _async_get_patched = False
-    _original_async_get: Any = None
-    _engine_registry: ClassVar[dict[int, CacheManager]] = {}
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
@@ -59,6 +69,11 @@ class CacheManager:
         # Background tasks spawned for post-commit invalidation; tracked so we can
         # await/cancel them on disconnect().
         self._pending_tasks: set[asyncio.Task[Any]] = set()
+        # Unique origin id for cross-process invalidation events; the listener
+        # filters out events it published itself to avoid double-applying them
+        # locally (most notably, double-bumping the table-version counter on
+        # bulk DML).
+        self._origin_id = uuid.uuid4().hex
 
     @property
     def config(self) -> dict[str, Any]:
@@ -69,10 +84,7 @@ class CacheManager:
             await self.disconnect()
         self._bound_engine = engine
         self._bound_sync_engine = engine.sync_engine if isinstance(engine, AsyncEngine) else engine
-        if self._bound_sync_engine is not None:
-            self._engine_registry[id(self._bound_sync_engine)] = self
         await self._ensure_transport()
-        self._patch_async_get()
         self._register_listeners()
         await self._maybe_setup_pubsub()
 
@@ -153,21 +165,8 @@ class CacheManager:
         if self._transport is not None:
             await self._transport.disconnect()
             self._transport = None
-        if self._bound_sync_engine is not None:
-            self._engine_registry.pop(id(self._bound_sync_engine), None)
-        if not self._engine_registry:
-            self._restore_async_get()
         self._bound_engine = None
         self._bound_sync_engine = None
-
-    def bind_sync(self, engine: Any) -> None:
-        raise NotImplementedError("Sync session support is deferred to v0.2.0")
-
-    def execute_sync(self, session: Any, statement: Any, timeout: int | None = None) -> Any:
-        return self._run_sync(self.execute(session, statement, timeout=timeout))
-
-    def invalidate_sync(self, model: type[Any] | None = None, pks: list[Any] | None = None) -> None:
-        self._run_sync(self.invalidate(model=model, pks=pks))
 
     def _matches_session(self, session: Session) -> bool:
         if self._bound_sync_engine is None:
@@ -184,9 +183,9 @@ class CacheManager:
             return []
         return extracted if isinstance(extracted, list) else [extracted]
 
-    async def _build_cache_key(self, statement: Any, models: list[type[Any]]) -> str:
+    async def _build_cache_key(self, statement: Any, models: list[type[Any]], parameters: Any = None) -> str:
         prefix = self._config["prefix"]
-        base_key = generate_cache_key(statement, prefix=prefix)
+        base_key = generate_cache_key(statement, prefix=prefix, parameters=parameters)
         if not models:
             return base_key
         transport = self._transport
@@ -195,7 +194,30 @@ class CacheManager:
         return f"{base_key}:v{'.'.join(versions)}"
 
     def _register_listeners(self) -> None:
+        global _eager_loader_probe_done
+
         from sqlacache.config import _resolve_model
+
+        if not _eager_loader_probe_done:
+            _eager_loader_probe_done = True
+            try:
+                detected = probe_eager_loader_detection()
+            except Exception:  # pragma: no cover - exact failures depend on SA internals
+                logger.warning(
+                    "sqlacache: eager-loader detection probe raised — has_eager_loaders may "
+                    "be looking at SQLAlchemy internals that have moved. Eager-loaded "
+                    "queries could be silently cached and return stale joined data; "
+                    "verify your SQLAlchemy version is supported.",
+                    exc_info=True,
+                )
+            else:
+                if not detected:
+                    logger.warning(
+                        "sqlacache: eager-loader detection probe failed — selectinload was "
+                        "not detected as an eager loader. Eager-loaded queries may be "
+                        "silently cached and return stale joined data; verify your "
+                        "SQLAlchemy version is supported."
+                    )
 
         select_listener = build_do_orm_execute_handler(self)
         self._listeners.append((Session, "do_orm_execute", select_listener))
@@ -210,6 +232,15 @@ class CacheManager:
             try:
                 model = _resolve_model(model_path)
             except Exception:
+                # User explicitly listed this model — failing silently means
+                # writes to it never invalidate the cache and the user finds
+                # out by debugging stale reads later. Log loudly instead.
+                logger.warning(
+                    "sqlacache: could not resolve configured model %r; mutations to it "
+                    "will not invalidate the cache. Check the dotted import path.",
+                    model_path,
+                    exc_info=True,
+                )
                 continue
             for identifier, action in (
                 ("after_insert", "insert"),
@@ -235,6 +266,22 @@ class CacheManager:
         event.listen(Session, "after_soft_rollback", rollback_listener)
 
     async def _maybe_setup_pubsub(self) -> None:
+        """Subscribe to cross-process invalidation events on Redis backends.
+
+        With ``redis://`` the cache is shared across workers, so a single
+        ``delete_tags()`` evicts entries that every worker reads from. Pub/sub
+        is *only* needed to invalidate per-worker derived state — today that
+        means the in-process table-version counter cached as part of cache key
+        construction (a future client-side caching mode would also live here).
+        Without pub/sub, after a bulk DML each worker would happily keep
+        building cache keys with the old table version until the next miss
+        forced a refresh.
+
+        For ``mem://`` (single-process) and any other non-Redis backend, the
+        cache is per-process anyway and there is no fan-out to do, so we skip
+        pub/sub entirely.
+        """
+
         from sqlacache.pubsub.redis import RedisPubSub
 
         backend = self._config["backend"]
@@ -245,6 +292,12 @@ class CacheManager:
         await self._pubsub.connect()
 
         async def on_invalidate(event_payload: dict[str, Any]) -> None:
+            # Ignore events we published ourselves: the local invalidation
+            # path already applied them. Without this filter, a bulk DML
+            # would double-bump the table-version counter (once locally,
+            # once when the listener loops back the same publish).
+            if event_payload.get("origin") == self._origin_id:
+                return
             # Ignore events we don't know how to handle rather than applying
             # them with potentially wrong semantics. If a future version of
             # sqlacache changes the payload schema, older workers in a mixed
@@ -280,12 +333,18 @@ class CacheManager:
     async def _publish_invalidation(self, model: type[Any], pks: list[Any], action: str) -> None:
         if self._pubsub is None:
             return
+        # Encode composite-PK tuples deterministically so the receiver builds
+        # the same tag string the publisher used. (JSON would otherwise
+        # serialize tuples as lists, and ``f"{table}:{[1, 2]}"`` would not
+        # match ``"{table}:1|2"`` from generate_tags.)
+        encoded_pks: list[Any] = [_encode_composite_pk(pk) if isinstance(pk, tuple) else pk for pk in pks]
         await self._pubsub.publish(
             {
                 "table": model.__tablename__,
-                "pks": pks,
+                "pks": encoded_pks,
                 "action": action,
                 "version": _PUBSUB_PROTOCOL_VERSION,
+                "origin": self._origin_id,
             }
         )
 
@@ -321,11 +380,12 @@ class CacheManager:
     async def flush_pending(self) -> None:
         """Wait for any in-flight post-commit invalidations to complete.
 
-        Call this after ``session.commit()`` when you need strict read-after-write
-        consistency against the cache on the same session (e.g. in tests, or when
-        a request commits and then immediately re-reads the same row). Normal
-        request-per-session patterns don't need this because the invalidation
-        task completes within one event loop turn.
+        For ``AsyncSession``, this is a no-op in the common case: the
+        ``after_commit`` handler now evicts inline via ``await_only`` before
+        ``await session.commit()`` returns. The method is kept because the
+        sync ``Session`` path under a running loop still schedules eviction
+        as a task — call this if you mix sync ``Session``s with async cache
+        invalidation and need strict read-after-write consistency.
         """
 
         if not self._pending_tasks:
@@ -333,10 +393,12 @@ class CacheManager:
         await asyncio.gather(*list(self._pending_tasks), return_exceptions=True)
 
     def _schedule_flush(self, pending: dict[str, Any]) -> None:
-        """Schedule invalidation application on the current event loop (sync Session path).
+        """Schedule invalidation application on the current event loop.
 
-        For AsyncSession, the ``after_commit`` handler drives the coroutine
-        synchronously via ``await_only`` instead of going through this method.
+        Used by the sync ``Session`` path under a running loop. The
+        ``AsyncSession`` path runs ``_apply_pending`` inline via ``await_only``
+        in the ``after_commit`` handler so eviction completes before
+        ``await session.commit()`` returns.
         """
 
         try:
@@ -348,14 +410,6 @@ class CacheManager:
         task = loop.create_task(self._apply_pending(pending))
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
-
-    @staticmethod
-    def _run_sync(coro: Any) -> Any:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(coro)
-        raise RuntimeError("Sync wrappers cannot be used while an event loop is already running")
 
     async def _apply_pending(self, pending: dict[str, Any]) -> None:
         transport = self._transport
@@ -376,55 +430,3 @@ class CacheManager:
         for model in bulk_tables:
             await _bump_table_version(transport, model)
             await self._publish_invalidation(model, [], action="table")
-
-    @classmethod
-    def _patch_async_get(cls) -> None:
-        if cls._async_get_patched:
-            return
-
-        cls._original_async_get = AsyncSession.get
-
-        async def patched_get(self: AsyncSession, entity: Any, ident: Any, **kwargs: Any) -> Any:
-            bind = self.sync_session.get_bind(mapper=entity)
-            manager = cls._engine_registry.get(id(bind))
-            if manager is None or not manager.is_enabled(entity, "get"):
-                return await cls._original_async_get(self, entity, ident, **kwargs)
-
-            unsupported = (
-                kwargs.get("options"),
-                kwargs.get("populate_existing"),
-                kwargs.get("with_for_update"),
-                kwargs.get("identity_token"),
-            )
-            if any(unsupported):
-                return await cls._original_async_get(self, entity, ident, **kwargs)
-
-            statement = manager._build_get_statement(
-                entity,
-                ident,
-                execution_options=kwargs.get("execution_options"),
-            )
-            result = await manager.execute(self, statement)
-            return result.scalar_one_or_none()
-
-        setattr(AsyncSession, "get", patched_get)  # noqa: B010
-        cls._async_get_patched = True
-
-    @classmethod
-    def _restore_async_get(cls) -> None:
-        if cls._async_get_patched and cls._original_async_get is not None:
-            setattr(AsyncSession, "get", cls._original_async_get)  # noqa: B010
-        cls._async_get_patched = False
-        cls._original_async_get = None
-
-    @staticmethod
-    def _build_get_statement(entity: type[Any], ident: Any, execution_options: Any = None) -> Any:
-        mapper = entity.__mapper__
-        pk_columns = list(mapper.primary_key)
-        values = [ident] if len(pk_columns) == 1 and not isinstance(ident, tuple) else list(ident)
-        if len(pk_columns) != len(values):
-            raise ValueError(f"Expected {len(pk_columns)} primary key values for {entity.__name__}, got {len(values)}")
-        statement = select(entity).where(*[column == value for column, value in zip(pk_columns, values, strict=True)])
-        if execution_options:
-            statement = statement.execution_options(**dict(execution_options))
-        return statement

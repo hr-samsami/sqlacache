@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-import pytest
 from sqlalchemy import delete, event, select, update
 
-from sqlacache.manager import CacheManager
-
-from .conftest import CompositeRecord, Product, User
+from .conftest import Product, User
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+    from sqlacache.manager import CacheManager
 
 
 # --- execute (manual caching API) ---
@@ -190,18 +189,17 @@ class TestBindAndDisconnect:
         # Old transport should have been disconnected, new one created
         assert manager._transport is not old_transport
 
-    async def test_bind_sync_raises(self) -> None:
-        from sqlacache import configure
 
-        manager = configure(backend="mem://", models={"*": {"timeout": 60}})
-        with pytest.raises(NotImplementedError, match="Sync session support"):
-            manager.bind_sync(None)
+# --- session.get() interception via do_orm_execute ---
 
 
-# --- AsyncSession.get() patching ---
+class TestSessionGetInterception:
+    """``session.get(Model, pk)`` uses SQLAlchemy's ``load_on_pk_identity``,
+    which fires ``do_orm_execute``. The interceptor recognises the resulting
+    statement as a primary-key lookup (``op="get"``) and caches it without any
+    monkey-patching of ``AsyncSession.get``.
+    """
 
-
-class TestAsyncGetPatching:
     async def test_automatic_caching_for_get(
         self, cache: CacheManager, session: AsyncSession, async_engine: AsyncEngine
     ) -> None:
@@ -213,7 +211,7 @@ class TestAsyncGetPatching:
         assert first is not None
         assert first.name == "u3"
 
-        # Delete from DB directly, bypassing cache invalidation
+        # Delete from DB directly, bypassing cache invalidation.
         stmt = delete(User).where(User.id == 3).execution_options(sqlacache_skip_interceptor=True)
         await session.execute(stmt)
         await session.commit()
@@ -236,13 +234,12 @@ class TestAsyncGetPatching:
         assert second.name == "u3"
         assert select_count == 0  # served from cache
 
-    async def test_get_with_unsupported_options_bypasses_cache(
-        self, cache: CacheManager, session: AsyncSession
-    ) -> None:
+    async def test_get_with_populate_existing_bypasses_cache(self, cache: CacheManager, session: AsyncSession) -> None:
         session.add(User(id=5, name="u5"))
         await session.commit()
         session.expunge_all()
 
+        # populate_existing forces a DB round-trip; the interceptor honours it.
         result = await session.get(User, 5, populate_existing=True)
         assert result is not None
         assert result.name == "u5"
@@ -387,30 +384,6 @@ class TestBuildCacheKey:
     async def test_empty_models_returns_base_key(self, cache: CacheManager, session: AsyncSession) -> None:
         key = await cache._build_cache_key(select(User), [])
         assert ":v" not in key
-
-
-# --- _build_get_statement ---
-
-
-class TestBuildGetStatement:
-    def test_single_pk(self) -> None:
-        stmt = CacheManager._build_get_statement(User, 42)
-        sql = str(stmt)
-        assert "users" in sql.lower()
-
-    def test_composite_pk(self) -> None:
-        stmt = CacheManager._build_get_statement(CompositeRecord, (1, 2))
-        sql = str(stmt)
-        assert "composite_records" in sql.lower()
-
-    def test_mismatched_pk_count_raises(self) -> None:
-        with pytest.raises(ValueError, match="Expected 2 primary key values"):
-            CacheManager._build_get_statement(CompositeRecord, (1,))
-
-    def test_execution_options_applied(self) -> None:
-        stmt = CacheManager._build_get_statement(User, 1, execution_options={"timeout": 5})
-        opts = stmt._execution_options
-        assert opts.get("timeout") == 5
 
 
 # --- _matches_session ---

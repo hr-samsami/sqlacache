@@ -9,34 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Invalidation correctness.** Row mutations no longer invalidate the cache from `after_insert`/`after_update`/`after_delete` mapper events (which fire during flush, before commit). A rolled-back transaction was evicting cache entries that were still valid, leaving other workers to repopulate from the pre-rollback state. Mapper events now only record pending invalidations on the session; eviction runs in `after_commit` and is discarded on `after_rollback`/`after_soft_rollback`.
-- **`session.execute(select(...))` on cache miss**. Previously raised `MissingGreenlet` for any uncached SELECT statement that reached `do_orm_execute` — the `await_only(resolve_cached_result(...))` pattern paused the provider greenlet before `invoke_statement()` could do DB IO. The SELECT path is now split: cache lookup is awaited, statement invocation runs synchronously in the provider greenlet, cache storage is awaited afterwards.
-- **Operation-type detection.** `detect_operation_type` previously stringified the SQL and searched for `"COUNT("` / `"EXISTS"` substrings, which false-positive on literals like `Model.name.like("%count(%")`. Now uses AST inspection of `statement._raw_columns`.
-- **Cache key dialect.** Cache keys were compiled against the sqlite dialect, which can raise or silently collapse distinct Postgres constructs (ILIKE, JSONB operators, ON CONFLICT). Switched to `StrCompileDialect`, SQLAlchemy's dialect-agnostic compiler.
-- **`pyproject.toml` URLs.** Homepage/Repository/Documentation/Issues pointed at `github.com/persix/sqlacache`, which doesn't exist. Now point at `hr-samsami/sqlacache`.
-- **Redis pub/sub resilience.** The listen loop previously died silently on any exception, stopping cross-process invalidation until the manager was rebound. Now reconnects with exponential backoff (0.5s → 30s). `publish()` swallows transient Redis failures rather than breaking the commit path.
+- Reads immediately after `session.commit()` could still return stale cached values.
+- Rolled-back transactions were incorrectly evicting valid cache entries.
+- Unflushed in-session writes could be overridden by cached rows.
+- Cross-process invalidation could be applied twice for the same event.
+- Health checks could fail spuriously on certain stored values.
+- Composite primary keys produced non-deterministic cache tags across runtimes.
+- Query literals containing `"count("` or `"exists("` were misclassified as those operation types.
+- Cache keys used a SQLite dialect, which could mangle Postgres-specific syntax.
+- Redis pub/sub listener stopped reconnecting after a connection error.
+- Package metadata URLs pointed to a non-existent repository.
 
 ### Added
 
-- `cache_manager.flush_pending()` — await in-flight post-commit invalidations. Useful in tests or when the same session commits and immediately re-reads.
-- `ModelJSONEncoder` — new `encode`/`decode` API that doesn't imply round-trip symmetry. `ModelJSONSerializer` kept as a backwards-compatible alias.
-- `RedisPubSub.is_healthy()` — exposes listener connection state for health checks.
-- `RedisPubSub.add_callback()` — replaces the misleading `listen()` name (kept as a deprecated alias).
-- Warning log when `generate_tags` drops `None` PKs (previously silent).
+- `cache_manager.flush_pending()` — await in-flight post-commit invalidations.
+- `RedisPubSub.is_healthy()` — check listener connection state (useful for health endpoints).
+- `RedisPubSub.add_callback()` — register invalidation event handlers (`listen()` is now deprecated).
+- Warnings logged when a configured model path can't be imported or a `None` PK row is skipped.
 
 ### Changed
 
-- **Eager-loaded relationships bypass the cache** with a warning log instead of being silently cached with untracked dependencies. Statements using `selectinload` / `joinedload` / `subqueryload` / `immediateload` go straight to the database.
-- Pub/sub payload version is now checked on receive (`_PUBSUB_PROTOCOL_VERSION`); events with a mismatched version are skipped rather than mis-applied.
-- Architecture design doc moved from repo root to `docs/architecture-and-roadmap.md`.
+- Queries with eager-loaded relationships (`selectinload`, `joinedload`, etc.) bypass the cache and always hit the database.
+- Architecture and roadmap doc moved to `docs/architecture-and-roadmap.md`.
 
 ### Removed
 
-- `configure(invalidation=...)` parameter — it was validated and stored but never read.
-- `params` kwarg on `statement_to_sql` / `generate_cache_key` — unreachable code path.
-- Legacy `after_bulk_update` / `after_bulk_delete` listeners — don't fire for 2.x ORM-enabled `update()`/`delete()` (handled by the `is_update`/`is_delete` branch of `do_orm_execute`).
-- Dead code: `_handle_select`, `_handle_bulk_mutation`, `resolve_cached_result`, `cache_query_result`.
-- Empty placeholder modules `contrib/fastapi.py` and `contrib/prometheus.py`.
+- `configure(invalidation=...)` parameter — had no effect.
+- Sync session methods (`bind_sync`, `execute_sync`, `invalidate_sync`) — sync support is deferred to v0.2.
+- `sqlacache.serializers` module — was never used.
 
 ## [0.1.1] - 2026-04-09
 

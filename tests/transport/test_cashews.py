@@ -336,5 +336,5 @@ class TestIsAvailable:
     async def test_unavailable_when_healthcheck_fails(self) -> None:
         transport = CashewsTransport("mem://")
         transport._connected = True
-        with patch.object(transport._cache, "get", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        with patch.object(transport._cache, "ping", new=AsyncMock(side_effect=RuntimeError("boom"))):
             assert await transport.is_available() is False

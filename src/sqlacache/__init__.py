@@ -1,5 +1,3 @@
-"""Public package exports for sqlacache."""
-
 from sqlacache.config import configure
 from sqlacache.exceptions import CacheError, ConfigError, TransportError
 from sqlacache.manager import CacheManager

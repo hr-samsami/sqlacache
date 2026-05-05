@@ -1,6 +1,3 @@
-"""Exception hierarchy for sqlacache."""
-
-
 class CacheError(Exception):
     """Base exception for sqlacache."""
 

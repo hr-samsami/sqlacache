@@ -35,7 +35,13 @@ def extract_model_from_statement(statement: Any) -> type[Any] | list[type[Any]] 
 
 
 def extract_pk_from_instance(instance: Any) -> Any:
-    """Extract the primary key value for a mapped ORM instance."""
+    """Extract the primary key value for a mapped ORM instance.
+
+    Returns the scalar PK for single-column primary keys; for composite primary
+    keys returns a tuple of values. Tag generation in :func:`generate_tags`
+    encodes composite tuples deterministically — see that function for the
+    on-the-wire format.
+    """
 
     mapper = inspect(instance).mapper
     values = tuple(getattr(instance, column.key) for column in mapper.primary_key)
@@ -128,6 +134,39 @@ def has_eager_loaders(statement: Any) -> bool:
                 if key == "lazy" and value in eager_strategies:
                     return True
     return False
+
+
+def probe_eager_loader_detection() -> bool:
+    """Sanity-check ``has_eager_loaders`` against a known-eager statement.
+
+    ``has_eager_loaders`` peeks at SQLAlchemy private attributes
+    (``option.context``, ``item.strategy``, the ``("lazy", ...)`` tuple form).
+    If SA renames those between releases, detection silently returns False and
+    eager-loaded queries get cached, returning stale joined data. This probe
+    constructs a throwaway mapped class with a relationship, attaches
+    ``selectinload``, and verifies the detector still fires. Returns False if
+    SA internals have drifted.
+    """
+
+    from sqlalchemy import ForeignKey, select
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+
+    class _ProbeBase(DeclarativeBase):
+        pass
+
+    class _ProbeParent(_ProbeBase):
+        __tablename__ = "_sqlacache_probe_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        children: Mapped[list[_ProbeChild]] = relationship(back_populates="parent")
+
+    class _ProbeChild(_ProbeBase):
+        __tablename__ = "_sqlacache_probe_child"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        parent_id: Mapped[int] = mapped_column(ForeignKey("_sqlacache_probe_parent.id"))
+        parent: Mapped[_ProbeParent] = relationship(back_populates="children")
+
+    stmt = select(_ProbeParent).options(selectinload(_ProbeParent.children))
+    return has_eager_loaders(stmt)
 
 
 def _is_primary_key_lookup(statement: Any, model: type[Any]) -> bool:

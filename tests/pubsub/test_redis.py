@@ -1,5 +1,3 @@
-"""Comprehensive tests for sqlacache.pubsub.redis.RedisPubSub."""
-
 from __future__ import annotations
 
 import asyncio
@@ -213,10 +211,20 @@ class TestListenLoop:
         await pubsub._listen_loop()
         assert call_count == 2
 
-    async def test_no_pubsub_returns_immediately(self) -> None:
+    async def test_listen_loop_exits_when_stopping_flag_set(self) -> None:
+        """The reconnect loop is a ``while not self._stopping`` — once stopping
+        is set, the loop exits without trying to (re)connect.
+
+        (The previous behaviour was that the loop returned immediately when
+        ``_pubsub`` was ``None``; the introduction of automatic reconnect
+        changed that — without ``_stopping`` set, the loop would now poll
+        Redis forever.)
+        """
+
         pubsub = RedisPubSub("redis://localhost:6379/1")
         pubsub._pubsub = None
-        await pubsub._listen_loop()  # should not raise
+        pubsub._stopping = True
+        await pubsub._listen_loop()  # should not raise and should not block
 
     async def test_cancelled_error_propagates(self) -> None:
         pubsub = RedisPubSub("redis://localhost:6379/1")

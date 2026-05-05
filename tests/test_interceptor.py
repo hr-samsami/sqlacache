@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import delete, event, select, update
 
 import sqlacache.interceptor as interceptor_module
 from sqlacache.interceptor import (
-    build_do_orm_execute_handler,
     build_post_commit_handler,
     build_rollback_handler,
     build_track_instance_handler,
@@ -16,193 +14,102 @@ from sqlacache.interceptor import (
 
 from .conftest import User
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-class DummyExecuteState:
-    """Minimal stand-in for ORMExecuteState used in unit tests."""
-
-    def __init__(
-        self,
-        session: Any,
-        statement: Any,
-        result: Any,
-        *,
-        is_select: bool = True,
-        is_update: bool = False,
-        is_delete: bool = False,
-    ) -> None:
-        self.session = session
-        self.statement = statement
-        self._result = result
-        self.is_select = is_select
-        self.is_update = is_update
-        self.is_delete = is_delete
-        self.execution_options: dict[str, Any] = {}
-        self.load_options: Any = None
-
-    def invoke_statement(self) -> Any:
-        return self._result
+    from sqlacache.manager import CacheManager
 
 
 # --- build_do_orm_execute_handler ---
+#
+# These tests run the real handler against a real ORM session and a real
+# in-memory cache. The previous version monkey-patched ``await_only``,
+# ``in_greenlet``, and ``merge_cached_result`` and asserted on the call order,
+# which meant they passed even if ``_lookup_cache`` / ``_store_and_merge``
+# were broken.
 
 
 class TestDoOrmExecuteHandler:
-    def test_select_cache_hit_returns_merged(self, cache: Any) -> None:
-        """On cache hit, handler calls await_only(_lookup_cache) and merges the frozen result."""
+    async def test_select_cache_miss_then_hit(
+        self, cache: CacheManager, session: AsyncSession, async_engine: AsyncEngine
+    ) -> None:
+        """First execute hits the DB and stores; second execute serves from cache."""
 
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        session = Session()
-        execute_state = DummyExecuteState(session, select(User), object())
+        session.add(User(id=1, name="alice"))
+        await session.commit()
 
-        # Simulate the two await_only calls the handler makes:
-        # 1. _lookup_cache → returns (frozen, key) on hit, None on miss.
-        fake_frozen = object()
-        calls: list[str] = []
+        select_count = 0
 
-        def fake_await_only(coro: Any) -> Any:
-            coro.close()
-            calls.append("await_only")
-            return (fake_frozen, "some-key")
+        def count_selects(conn: Any, cursor: Any, stmt: str, params: Any, context: Any, executemany: Any) -> None:
+            nonlocal select_count
+            if "SELECT" in stmt.upper() and "users" in stmt.lower():
+                select_count += 1
 
-        def fake_merge(sess: Any, stmt: Any, frozen: Any) -> str:
-            assert frozen is fake_frozen
-            return "merged"
-
-        orig_await = interceptor_module.await_only
-        orig_greenlet = interceptor_module.in_greenlet
-        orig_merge = interceptor_module.merge_cached_result
-        interceptor_module.await_only = fake_await_only
-        interceptor_module.in_greenlet = lambda: True
-        interceptor_module.merge_cached_result = fake_merge
-
+        event.listen(async_engine.sync_engine, "before_cursor_execute", count_selects)
         try:
-            handler = build_do_orm_execute_handler(manager)
-            assert handler(execute_state) == "merged"
-            assert calls == ["await_only"]
+            stmt = select(User).where(User.id == 1)
+            first = (await session.execute(stmt)).scalar_one()
+            assert first.name == "alice"
+            after_first = select_count
+
+            second = (await session.execute(stmt)).scalar_one()
+            assert second.name == "alice"
         finally:
-            interceptor_module.await_only = orig_await
-            interceptor_module.in_greenlet = orig_greenlet
-            interceptor_module.merge_cached_result = orig_merge
+            event.remove(async_engine.sync_engine, "before_cursor_execute", count_selects)
 
-    def test_select_cache_miss_invokes_statement(self, cache: Any) -> None:
-        """On cache miss, handler invokes the statement then stores the result."""
+        # Second execute issued no SELECT.
+        assert select_count == after_first
 
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        session = Session()
-        sentinel_result = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel_result)
+    async def test_skip_interceptor_option(
+        self, cache: CacheManager, session: AsyncSession, async_engine: AsyncEngine
+    ) -> None:
+        """``sqlacache_skip_interceptor`` execution option bypasses the cache entirely."""
 
-        # Track the sequence: lookup returns None (miss), invoke_statement is
-        # called, then _store_and_merge is awaited.
-        call_log: list[str] = []
-        orig_invoke = execute_state.invoke_statement
+        session.add(User(id=2, name="bob"))
+        await session.commit()
 
-        def logged_invoke() -> Any:
-            call_log.append("invoke")
-            return orig_invoke()
+        # Prime the cache.
+        await session.execute(select(User).where(User.id == 2))
 
-        execute_state.invoke_statement = logged_invoke  # type: ignore[method-assign]
+        select_count = 0
 
-        call_count = [0]
+        def count_selects(conn: Any, cursor: Any, stmt: str, params: Any, context: Any, executemany: Any) -> None:
+            nonlocal select_count
+            if "SELECT" in stmt.upper() and "users" in stmt.lower():
+                select_count += 1
 
-        def fake_await_only(coro: Any) -> Any:
-            coro.close()
-            call_count[0] += 1
-            if call_count[0] == 1:
-                call_log.append("lookup")
-                return None  # miss
-            call_log.append("store")
-            return "stored-and-merged"
-
-        orig_await = interceptor_module.await_only
-        orig_greenlet = interceptor_module.in_greenlet
-        interceptor_module.await_only = fake_await_only
-        interceptor_module.in_greenlet = lambda: True
+        event.listen(async_engine.sync_engine, "before_cursor_execute", count_selects)
         try:
-            handler = build_do_orm_execute_handler(manager)
-            assert handler(execute_state) == "stored-and-merged"
-            assert call_log == ["lookup", "invoke", "store"]
+            stmt = select(User).where(User.id == 2).execution_options(sqlacache_skip_interceptor=True)
+            await session.execute(stmt)
         finally:
-            interceptor_module.await_only = orig_await
-            interceptor_module.in_greenlet = orig_greenlet
+            event.remove(async_engine.sync_engine, "before_cursor_execute", count_selects)
 
-    def test_update_records_bulk_mutation(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        recorded: list[tuple[Any, type]] = []
-        manager._record_bulk_mutation = lambda session, model: recorded.append((session, model))
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel, is_select=False, is_update=True)
+        # The skip option forced a real DB SELECT.
+        assert select_count >= 1
 
-        handler = build_do_orm_execute_handler(manager)
-        result = handler(execute_state)
-        assert result is sentinel
-        assert recorded == [(session, User)]
+    async def test_update_records_bulk_mutation(self, cache: CacheManager, session: AsyncSession) -> None:
+        """Bulk UPDATE flowing through do_orm_execute records a bulk mutation on the session."""
 
-    def test_delete_records_bulk_mutation(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        recorded: list[tuple[Any, type]] = []
-        manager._record_bulk_mutation = lambda session, model: recorded.append((session, model))
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel, is_select=False, is_delete=True)
+        session.add(User(id=3, name="c"))
+        await session.commit()
 
-        handler = build_do_orm_execute_handler(manager)
-        result = handler(execute_state)
-        assert result is sentinel
-        assert recorded == [(session, User)]
+        await session.execute(update(User).where(User.id == 3).values(name="C"))
+        # The interceptor records a bulk-table mutation on the underlying sync session.
+        pending = cache._pending.get(session.sync_session)
+        assert pending is not None
+        assert User in pending["bulk_tables"]
 
-    def test_skip_interceptor_option(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel)
-        execute_state.execution_options["sqlacache_skip_interceptor"] = True
+    async def test_delete_records_bulk_mutation(self, cache: CacheManager, session: AsyncSession) -> None:
+        """Bulk DELETE flowing through do_orm_execute records a bulk mutation on the session."""
 
-        handler = build_do_orm_execute_handler(manager)
-        assert handler(execute_state) is sentinel
+        session.add(User(id=4, name="d"))
+        await session.commit()
 
-    def test_unmatched_session_invokes_statement(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: False  # type: ignore[method-assign]
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel)
-
-        handler = build_do_orm_execute_handler(manager)
-        assert handler(execute_state) is sentinel
-
-    def test_non_greenlet_select_invokes_statement(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(session, select(User), sentinel)
-
-        orig_greenlet = interceptor_module.in_greenlet
-        interceptor_module.in_greenlet = lambda: False
-        try:
-            handler = build_do_orm_execute_handler(manager)
-            assert handler(execute_state) is sentinel
-        finally:
-            interceptor_module.in_greenlet = orig_greenlet
-
-    def test_non_select_non_update_non_delete_invokes_statement(self, cache: Any) -> None:
-        manager = cache
-        manager._matches_session = lambda session: True  # type: ignore[method-assign]
-        session = Session()
-        sentinel = object()
-        execute_state = DummyExecuteState(
-            session, select(User), sentinel, is_select=False, is_update=False, is_delete=False
-        )
-
-        handler = build_do_orm_execute_handler(manager)
-        assert handler(execute_state) is sentinel
+        await session.execute(delete(User).where(User.id == 4))
+        pending = cache._pending.get(session.sync_session)
+        assert pending is not None
+        assert User in pending["bulk_tables"]
 
 
 # --- build_track_instance_handler ---

@@ -1,5 +1,3 @@
-"""Cashews-based transport implementation."""
-
 from __future__ import annotations
 
 import logging
@@ -130,7 +128,11 @@ class CashewsTransport:
         if not self._connected:
             return False
         try:
-            await self._cache.get("__sqlacache_healthcheck__")
+            # Use cashews' native ping rather than reading a sentinel key.
+            # Reading a key would route through the configured serializer,
+            # so a poisoned/unrelated value at that key would fail the
+            # healthcheck even when the backend itself is fine.
+            await self._cache.ping()
         except Exception:
             return False
         return True

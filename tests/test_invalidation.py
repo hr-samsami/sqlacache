@@ -23,11 +23,11 @@ class TestGenerateTags:
         assert generate_tags(User, [1, 2, 3]) == ["users:1", "users:2", "users:3"]
 
     def test_composite_pks(self) -> None:
-        assert generate_tags(CompositeRecord, [(1, 2)]) == ["composite_records:(1, 2)"]
+        assert generate_tags(CompositeRecord, [(1, 2)]) == ["composite_records:1|2"]
 
     def test_multiple_composite_pks(self) -> None:
         result = generate_tags(CompositeRecord, [(1, 2), (3, 4)])
-        assert result == ["composite_records:(1, 2)", "composite_records:(3, 4)"]
+        assert result == ["composite_records:1|2", "composite_records:3|4"]
 
     def test_ignores_none_pks(self) -> None:
         assert generate_tags(User, [None, 1, None, 2]) == ["users:1", "users:2"]
